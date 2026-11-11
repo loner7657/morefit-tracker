@@ -1,2 +1,2 @@
 // 自動由 fetch.py 產生，供本機直接開啟 index.html (file://) 時讀取
-window.MOREFIT_CSV = "timestamp,date,weekday,weekday_name,time_slot,store_id,store_name,current_total,capacity_limit,usage_rate_pct\n2026-11-11 20:19:53,2026-11-11,3,週三,20:21,by9RbNgReN,七張店,159,400,39.8\n2026-11-11 20:19:53,2026-11-11,3,週三,20:21,bKnNJ81nGW,古亭店,158,450,35.1\n";
+window.MOREFIT_CSV = "timestamp,date,weekday,weekday_name,time_slot,store_id,store_name,current_total,capacity_limit,usage_rate_pct\n2026-11-11 20:19:53,2026-11-11,3,週三,20:21,by9RbNgReN,七張店,159,400,39.8\n2026-11-11 20:19:53,2026-11-11,3,週三,20:21,bKnNJ81nGW,古亭店,158,450,35.1\n2026-11-11 21:08:26,2026-11-11,3,週三,21:09,by9RbNgReN,七張店,148,400,37.0\n2026-11-11 21:08:26,2026-11-11,3,週三,21:09,bKnNJ81nGW,古亭店,142,450,31.6\n";
