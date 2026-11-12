@@ -2,14 +2,13 @@
 """
 More Fit 健身房人數定時採集腳本（七張店、古亭店）
 採集區間：
-  - 平日（週一至週五）：17:30 – 21:00
-  - 週末（週六至週日）：08:00 – 21:00
-採集策略：每 3 分鐘抓取一次即時人數，每 15 分鐘批次合併存檔一次。
+  - 平日（週一至週五）：17:30 – 21:00（支援 17:20 起預熱待命）
+  - 週末（週六至週日）：08:00 – 21:00（支援 07:50 起預熱待命）
+採集策略：
+  - 單次長連線常駐採集（最長涵蓋整個平日晚間 3.5 小時，週末每 ~4.2 小時無縫接力），
+    徹底避免 GitHub Actions 排程漏觸發導致中途斷線的問題。
+  - 每 3 分鐘對齊時鐘抓取一筆即時人數，每集滿 5 筆（15 分鐘）自動執行 git commit & push 同步上雲端。
 僅使用 Python 標準函式庫，免安裝任何第三方套件。
-
-每次執行會更新：
-  1. data/capacity_history.csv（歷史累積原始資料）
-  2. data/capacity_data.js（供本機直接開啟 index.html 離線讀取用）
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ import argparse
 import csv
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -37,7 +37,6 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-# 鎖定目標分店（以分店名稱與不分大小寫 storeId 雙重比對）
 TARGET_STORES = {"七張店", "古亭店"}
 TARGET_IDS_LOWER = {"by9rbngren", "bknnj81ngw"}
 
@@ -52,7 +51,7 @@ WEEKDAY_NAMES = {
 }
 
 SAMPLE_INTERVAL_MINUTES = 3
-BATCH_WINDOW_MINUTES = 15
+SYNC_EVERY_N_SAMPLES = 5  # 每 5 個刻度（15 分鐘）自動 git push 一次
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -82,37 +81,55 @@ def get_nearest_3m_slot(dt: datetime) -> str:
     return f"{slot_hour:02d}:{slot_minute:02d}"
 
 
-def is_within_target_window(dt: datetime) -> bool:
+def get_window_start_dt(dt: datetime) -> datetime:
+    """回傳當日正式開始採集的時間（平日 17:30:00 / 週末 08:00:00）。"""
+    if dt.isoweekday() <= 5:
+        return dt.replace(hour=17, minute=30, second=0, microsecond=0)
+    return dt.replace(hour=8, minute=0, second=0, microsecond=0)
+
+
+def is_within_or_prewarm_window(dt: datetime) -> bool:
     """
-    檢查是否落在目標採集時段（含前後 2 分鐘排程緩衝）：
-      - 週一至週五 (1~5)：17:28 ~ 21:02（對應 17:30 – 21:00）
-      - 週六至週日 (6~7)：07:58 ~ 21:02（對應 08:00 – 21:00）
+    檢查是否落在有效採集區間（含提早 10 分鐘預熱緩衝）：
+      - 平日 (1~5)：17:20 ~ 21:02（正式採集 17:30 – 21:00）
+      - 週末 (6~7)：07:50 ~ 21:02（正式採集 08:00 – 21:00）
     """
     minutes_of_day = dt.hour * 60 + dt.minute
     if dt.isoweekday() <= 5:
-        return (17 * 60 + 28) <= minutes_of_day <= (21 * 60 + 2)
-    return (8 * 60 - 2) <= minutes_of_day <= (21 * 60 + 2)
+        return (17 * 60 + 20) <= minutes_of_day <= (21 * 60 + 2)
+    return (7 * 60 + 50) <= minutes_of_day <= (21 * 60 + 2)
 
 
-def get_batch_deadline(start_dt: datetime) -> datetime:
+def is_within_active_sampling_window(dt: datetime) -> bool:
+    """檢查是否落在正式採集時段（平日 17:29~21:01 / 週末 07:59~21:01）。"""
+    minutes_of_day = dt.hour * 60 + dt.minute
+    if dt.isoweekday() <= 5:
+        return (17 * 60 + 29) <= minutes_of_day <= (21 * 60 + 1)
+    return (7 * 60 + 59) <= minutes_of_day <= (21 * 60 + 1)
+
+
+def get_session_deadline(start_dt: datetime) -> datetime:
     """
-    計算本次 15 分鐘批次的結束截止時間：
-    若排程提早數秒觸發（例如 17:29:55），先往後推 30 秒對齊目標 15 分鐘區間；
-    在下一個 15 分鐘整點（:00/:15/:30/:45）前 75 秒結束，預留充裕時間給 git push，
-    且絕不超過當日 21:01:30。
+    計算本次常駐階段的結束時間：
+      - 平日晚間（17:30–21:00 共 3.5 小時）：直接一路常駐執行到 21:01:00 收工！
+      - 週末全天（08:00–21:00 共 13 小時）：因 GitHub 單次 Job 上限為 6 小時，
+        拆為三段無縫接力（早班至 12:06:30、午班至 16:36:30、晚班至 21:01:00），
+        精準對齊 :07 / :37 備援排程，確保 0 漏抓。
     """
-    ref_dt = start_dt + timedelta(seconds=30) if (start_dt.minute % BATCH_WINDOW_MINUTES == BATCH_WINDOW_MINUTES - 1 and start_dt.second >= 30) else start_dt
-    floored_minute = (ref_dt.minute // BATCH_WINDOW_MINUTES) * BATCH_WINDOW_MINUTES
-    block_start = ref_dt.replace(minute=floored_minute, second=0, microsecond=0)
-    next_block = block_start + timedelta(minutes=BATCH_WINDOW_MINUTES)
-    block_cutoff = next_block - timedelta(seconds=75)
+    end_of_day = start_dt.replace(hour=21, minute=1, second=0, microsecond=0)
+    if start_dt.isoweekday() <= 5:
+        return end_of_day
 
-    end_of_evening = start_dt.replace(hour=21, minute=1, second=30, microsecond=0)
-    return min(block_cutoff, end_of_evening)
+    mins = start_dt.hour * 60 + start_dt.minute
+    if mins < 11 * 60 + 50:
+        return start_dt.replace(hour=12, minute=6, second=30, microsecond=0)
+    if mins < 16 * 60 + 20:
+        return start_dt.replace(hour=16, minute=36, second=30, microsecond=0)
+    return end_of_day
 
 
 def get_next_3m_tick(dt: datetime) -> datetime:
-    """計算下一個有效的 3 分鐘整點時間（若距離過近 <45 秒則推進至下一格，避免同刻度重複喚醒）。"""
+    """計算下一個有效的 3 分鐘整點時間（若距離 <45 秒則推進至下一格，避免重複抓取）。"""
     next_min_block = ((dt.minute // SAMPLE_INTERVAL_MINUTES) + 1) * SAMPLE_INTERVAL_MINUTES
     base_hour = dt.replace(minute=0, second=0, microsecond=0)
     candidate = base_hour + timedelta(minutes=next_min_block)
@@ -149,6 +166,55 @@ def sync_js_data_bundle() -> None:
     )
     with open(JS_DATA_PATH, mode="w", encoding="utf-8") as f:
         f.write(js_content)
+
+
+def git_sync_data() -> None:
+    """在 GitHub Actions 常駐執行期間，每 15 分鐘將最新 CSV 與 JS 同步提交並推送至儲存庫。"""
+    sync_js_data_bundle()
+    try:
+        subprocess.run(
+            ["git", "config", "user.name", "github-actions[bot]"],
+            cwd=BASE_DIR,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
+            cwd=BASE_DIR,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "add", "data/capacity_history.csv", "data/capacity_data.js"],
+            cwd=BASE_DIR,
+            check=True,
+        )
+        diff_proc = subprocess.run(
+            ["git", "diff", "--staged", "--quiet"],
+            cwd=BASE_DIR,
+        )
+        if diff_proc.returncode == 0:
+            return
+
+        now_tag = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+        subprocess.run(
+            ["git", "commit", "-m", f"chore(data): sync capacity batch ({now_tag})"],
+            cwd=BASE_DIR,
+            check=True,
+        )
+        branch = os.environ.get("GITHUB_REF_NAME", "main")
+        subprocess.run(
+            ["git", "pull", "--rebase", "-X", "ours", "origin", branch],
+            cwd=BASE_DIR,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "push", "origin", f"HEAD:{branch}"],
+            cwd=BASE_DIR,
+            check=True,
+        )
+        print(f"[{now_tag}] 已成功將本批數據同步推送至 GitHub！", flush=True)
+    except Exception as exc:
+        err_t = datetime.now(TZ_TAIPEI).strftime("%H:%M:%S")
+        print(f"[{err_t}] Git 同步警告（資料仍保留於本機，將於下批重試推送）：{exc}", flush=True)
 
 
 def fetch_stores_with_retry(retries: int = 2) -> list[dict]:
@@ -228,11 +294,11 @@ def capture_once(existing_keys: set[tuple[str, str, str]]) -> int:
     return len(new_rows)
 
 
-def run(force: bool = False, once: bool = False) -> int:
+def run(force: bool = False, once: bool = False, git_sync: bool = False) -> int:
     now = datetime.now(TZ_TAIPEI)
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    if not force and not is_within_target_window(now):
+    if not force and not is_within_or_prewarm_window(now):
         print(
             f"[{now_str}] 非目標採集時段（平日 17:30–21:00 / 週末 08:00–21:00），略過執行。"
             "若需手動測試寫入請加上 --force。"
@@ -244,40 +310,68 @@ def run(force: bool = False, once: bool = False) -> int:
     # 若為手動強制測試 (--force) 或指定單次 (--once)，抓完一筆立即結束存檔
     if force or once:
         capture_once(existing_keys)
-        sync_js_data_bundle()
+        if git_sync:
+            git_sync_data()
+        else:
+            sync_js_data_bundle()
         return 0
 
-    # 15 分鐘批次模式：每 3 分鐘對齊時鐘抓取一次，直到本 15 分鐘區間結束（或抵達 21:00）
-    deadline = get_batch_deadline(now)
+    # 若由預熱排程提早喚醒（如 17:22 或 07:52），先待機至正式開始時間 (17:30:00 / 08:00:00)
+    win_start = get_window_start_dt(now)
+    if now < win_start:
+        wait_secs = (win_start - now).total_seconds()
+        print(
+            f"[{now_str}] 預熱喚醒成功！等待 {int(wait_secs)} 秒至 {win_start.strftime('%H:%M:%S')} 準時開抓...",
+            flush=True,
+        )
+        time.sleep(max(0.0, wait_secs))
+        now = datetime.now(TZ_TAIPEI)
+
+    deadline = get_session_deadline(now)
     print(
-        f"[{now_str}] 啟動 15 分鐘批次採樣（每 {SAMPLE_INTERVAL_MINUTES} 分鐘抓取一次，"
-        f"預計至 {deadline.strftime('%H:%M:%S')} 結束並統一存檔）",
+        f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 啟動常駐採集階段（每 {SAMPLE_INTERVAL_MINUTES} 分鐘抓取一次，"
+        f"每 15 分鐘自動同步雲端，持續運行至 {deadline.strftime('%H:%M:%S')}）",
         flush=True,
     )
 
     total_written = 0
+    ticks_since_sync = 0
     errors = 0
 
     while True:
-        try:
-            total_written += capture_once(existing_keys)
-        except Exception as exc:
-            errors += 1
-            err_time = datetime.now(TZ_TAIPEI).strftime("%H:%M:%S")
-            print(f"[{err_time}] 單次抓取發生錯誤（將於下個刻度重試）：{exc}", flush=True)
+        cur_dt = datetime.now(TZ_TAIPEI)
+        if is_within_active_sampling_window(cur_dt):
+            try:
+                added = capture_once(existing_keys)
+                total_written += added
+                ticks_since_sync += 1
+            except Exception as exc:
+                errors += 1
+                err_time = datetime.now(TZ_TAIPEI).strftime("%H:%M:%S")
+                print(f"[{err_time}] 單次抓取發生錯誤（將於下個刻度重試）：{exc}", flush=True)
+
+            # 每集滿 5 個刻度（15 分鐘）或遇到 :12/:27/:42/:57 刻度，自動同步推送一次
+            cur_slot_min = int(get_nearest_3m_slot(datetime.now(TZ_TAIPEI)).split(":")[1])
+            if git_sync and (ticks_since_sync >= SYNC_EVERY_N_SAMPLES or cur_slot_min in (12, 27, 42, 57)):
+                git_sync_data()
+                ticks_since_sync = 0
 
         after_dt = datetime.now(TZ_TAIPEI)
         next_tick = get_next_3m_tick(after_dt)
 
-        if next_tick > deadline or not is_within_target_window(next_tick):
+        if next_tick > deadline or not is_within_active_sampling_window(next_tick):
             break
 
         sleep_secs = max(1.0, (next_tick - after_dt).total_seconds())
         time.sleep(sleep_secs)
 
-    sync_js_data_bundle()
+    if git_sync:
+        git_sync_data()
+    else:
+        sync_js_data_bundle()
+
     end_str = datetime.now(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{end_str}] 本批次完成，共新增 {total_written} 筆資料。", flush=True)
+    print(f"[{end_str}] 本階段採集完成，共新增 {total_written} 筆資料。", flush=True)
 
     if total_written == 0 and errors > 0:
         return 1
@@ -294,7 +388,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--once",
         action="store_true",
-        help="僅抓取當下單筆紀錄即結束（不進入 15 分鐘循環）",
+        help="僅抓取當下單筆紀錄即結束",
+    )
+    parser.add_argument(
+        "--git-sync",
+        action="store_true",
+        help="每 15 分鐘自動執行 git commit & push 同步至遠端儲存庫（GitHub Actions 專用）",
     )
     args = parser.parse_args()
-    sys.exit(run(force=args.force, once=args.once))
+    sys.exit(run(force=args.force, once=args.once, git_sync=args.git_sync))
