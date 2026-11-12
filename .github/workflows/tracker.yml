@@ -1,6 +1,13 @@
 name: MoreFit Capacity Tracker
 
 on:
+  # 當排程設定檔更新推送至 main 時，自動觸發註冊排程並立即抓一筆驗證
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/tracker.yml'
+
   # 支援外部準時排程 (如 cron-job.org 每 15 分鐘觸發一次) 或手動點擊執行
   workflow_dispatch:
     inputs:
@@ -10,7 +17,7 @@ on:
         default: false
         type: boolean
 
-  # GitHub 內建排程備援：
+  # GitHub 內建自動排程：
   # 1. 台灣時間 (UTC+8) 週一至週五 17:30 - 21:00 (對應 UTC 09:30 - 13:00)
   # 2. 台灣時間 (UTC+8) 週六至週日 08:00 - 21:00 (對應 UTC 00:00 - 13:00)
   # 每次喚醒後，fetch.py 會在該 15 分鐘區間內「每 3 分鐘抓取一筆」，結束後統一合併 commit & push
@@ -38,7 +45,7 @@ jobs:
 
       - name: Fetch capacity every 3 mins (15-min batch)
         run: |
-          if [ "${{ inputs.force }}" = "true" ]; then
+          if [ "${{ inputs.force }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; then
             python3 fetch.py --force
           else
             python3 fetch.py
@@ -52,7 +59,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "本批次無新增資料需要提交。"
           else
-            git commit -m "chore(data): record 15m capacity batch (3m interval)"
+            git commit -m "chore(data): record capacity snapshot"
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push
           fi
