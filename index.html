@@ -1657,15 +1657,27 @@
 
       async function loadInitialData() {
         demoRows = buildDemoRows();
+        const remoteCsvUrl = `https://raw.githubusercontent.com/loner7657/morefit-tracker/main/data/capacity_history.csv?t=${Date.now()}`;
+
+        // 1. 優先直接讀取雲端儲存庫最新 CSV（不論開啟 GitHub Pages 或雙擊本機 index.html 都能即時拿到最新雲端資料）
         try {
-          const res = await fetch(`./data/capacity_history.csv?t=${Date.now()}`, { cache: "no-store" });
-          if (res.ok) {
-            realRawCsv = await res.text();
+          const remoteRes = await fetch(remoteCsvUrl, { cache: "no-store" });
+          if (remoteRes.ok) {
+            realRawCsv = await remoteRes.text();
           }
-        } catch (_) {
-          // file:// 離線開啟會改用 capacity_data.js 內的 window.MOREFIT_CSV
+        } catch (_) {}
+
+        // 2. 次選讀取同網域相對路徑 CSV
+        if (!realRawCsv) {
+          try {
+            const localRes = await fetch(`./data/capacity_history.csv?t=${Date.now()}`, { cache: "no-store" });
+            if (localRes.ok) {
+              realRawCsv = await localRes.text();
+            }
+          } catch (_) {}
         }
 
+        // 3. 完全無網路離線備援：讀取本機 capacity_data.js
         if (!realRawCsv && typeof window.MOREFIT_CSV === "string") {
           realRawCsv = window.MOREFIT_CSV;
         }
