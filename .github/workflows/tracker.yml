@@ -8,7 +8,7 @@ on:
     paths:
       - '.github/workflows/tracker.yml'
 
-  # 支援外部準時排程 (如 cron-job.org 每 15 分鐘觸發一次) 或手動點擊執行
+  # 支援外部排程 (如 cron-job.org) 或手動點擊執行
   workflow_dispatch:
     inputs:
       force:
@@ -17,49 +17,49 @@ on:
         default: false
         type: boolean
 
-  # GitHub 內建自動排程：
-  # 1. 台灣時間 (UTC+8) 週一至週五 17:30 - 21:00 (對應 UTC 09:30 - 13:00)
-  # 2. 台灣時間 (UTC+8) 週六至週日 08:00 - 21:00 (對應 UTC 00:00 - 13:00)
-  # 每次喚醒後，fetch.py 會在該 15 分鐘區間內「每 3 分鐘抓取一筆」，結束後統一合併 commit & push
+  # GitHub 內建自動排程（刻意採用 7,22,37,52 錯開全球整點 :00/:15 排隊塞車潮，並提早 8 分鐘預熱）：
+  # 1. 平日晚間：台灣時間 17:22 預熱啟動，單一任務直接常駐執行至 21:00（期間每 15 分鐘自動推送數據）
+  #    後續每 15 分鐘的排程作為斷線自動接力備援（若已有任務運行中會 1 秒自動略過）
+  # 2. 週末全天：台灣時間 07:52 預熱啟動，分三段常駐無縫接力至 21:00
   schedule:
-    - cron: '30,45 9 * * 1-5'
-    - cron: '0,15,30,45 10-12 * * 1-5'
-    - cron: '0 13 * * 1-5'
-    - cron: '0,15,30,45 0-12 * * 0,6'
-    - cron: '0 13 * * 0,6'
+    - cron: '22,37,52 9 * * 1-5'
+    - cron: '7,22,37,52 10-12 * * 1-5'
+    - cron: '52 23 * * 5,6'
+    - cron: '7,22,37,52 0-12 * * 0,6'
 
 permissions:
   contents: write
-
-concurrency:
-  group: capacity-tracker-write
-  cancel-in-progress: false
+  actions: read
 
 jobs:
   scrape-and-save:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 290
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Fetch capacity every 3 mins (15-min batch)
+      - name: Check if an active session is already running
+        id: guard
+        if: inputs.force != true && github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ inputs.force }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; then
-            python3 fetch.py --force
+          ACTIVE_COUNT=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/workflows/tracker.yml/runs?status=in_progress" --jq '[.workflow_runs[] | select(.id != '"${GITHUB_RUN_ID}"')] | length')
+          echo "Active running sessions (excluding self): ${ACTIVE_COUNT}"
+          if [ "${ACTIVE_COUNT}" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "已有常駐採集任務正在穩定運行中，本次備援喚醒自動略過。"
           else
-            python3 fetch.py
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit and push batch data
+      - name: Checkout repository
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Run continuous 3-min sampler with 15-min live Git sync
+        if: steps.guard.outputs.skip != 'true'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/capacity_history.csv data/capacity_data.js
-          if git diff --staged --quiet; then
-            echo "本批次無新增資料需要提交。"
+          if [ "${{ inputs.force }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; then
+            python3 fetch.py --force --git-sync
           else
-            git commit -m "chore(data): record capacity snapshot"
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push
+            python3 fetch.py --git-sync
           fi
