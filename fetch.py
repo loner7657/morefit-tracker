@@ -336,6 +336,7 @@ def run(force: bool = False, once: bool = False, git_sync: bool = False) -> int:
 
     total_written = 0
     ticks_since_sync = 0
+    synced_first = False
     errors = 0
 
     while True:
@@ -350,11 +351,18 @@ def run(force: bool = False, once: bool = False, git_sync: bool = False) -> int:
                 err_time = datetime.now(TZ_TAIPEI).strftime("%H:%M:%S")
                 print(f"[{err_time}] 單次抓取發生錯誤（將於下個刻度重試）：{exc}", flush=True)
 
-            # 每集滿 5 個刻度（15 分鐘）或遇到 :12/:27/:42/:57 刻度，自動同步推送一次
+            # 首筆寫入立即同步上雲端，之後每集滿 5 個刻度（15 分鐘）或遇到 :12/:27/:42/:57 刻度自動同步推送一次
             cur_slot_min = int(get_nearest_3m_slot(datetime.now(TZ_TAIPEI)).split(":")[1])
-            if git_sync and (ticks_since_sync >= SYNC_EVERY_N_SAMPLES or cur_slot_min in (12, 27, 42, 57)):
+            should_sync = (
+                (not synced_first and total_written > 0)
+                or ticks_since_sync >= SYNC_EVERY_N_SAMPLES
+                or cur_slot_min in (12, 27, 42, 57)
+            )
+            if git_sync and should_sync:
                 git_sync_data()
                 ticks_since_sync = 0
+                if total_written > 0:
+                    synced_first = True
 
         after_dt = datetime.now(TZ_TAIPEI)
         next_tick = get_next_3m_tick(after_dt)
